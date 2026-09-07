@@ -1,0 +1,583 @@
+# -*- coding: utf-8 -*-
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+import mysql.connector
+import bcrypt
+from datetime import datetime
+from jinja2 import Template
+
+app = FastAPI()
+
+# Konfiguracja bazy danych MySQL
+DB_CONFIG = {
+    'host': 'localhost',
+    'database': 'system_magazynowy',
+    'user': 'root',
+    'password': ''  # Wpisz swoje hasło do MySQL, jeśli je posiadasz
+}
+
+def get_db_connection():
+    return mysql.connector.connect(**DB_CONFIG)
+
+current_session_user_id = None
+
+# --- HTML SZABLONY Z KAFELKAMI DO LOGOWANIA ---
+
+HTML_LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <title>Wybierz Użytkownika - Terminal Magazynowy</title>
+    <style>
+        body { background-color: #121212; color: #ffffff; font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .login-container { background: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.6); width: 600px; text-align: center; }
+        h2 { color: #4CAF50; margin-bottom: 25px; }
+        .tiles-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .tile { background: #2c2c2c; border: 2px solid #444; border-radius: 8px; padding: 20px 10px; cursor: pointer; transition: 0.2s; text-align: center; }
+        .tile:hover { background: #3a3a3a; border-color: #4CAF50; transform: translateY(-3px); }
+        .tile.selected { background: #1b4d3e; border-color: #4CAF50; }
+        .tile-name { font-weight: bold; font-size: 16px; margin-bottom: 5px; color: #fff; }
+        .tile-role { font-size: 12px; color: #aaa; text-transform: uppercase; }
+        .pin-box { margin-top: 25px; display: none; background: #252525; padding: 20px; border-radius: 8px; border: 1px solid #444; }
+        input[type="password"] { width: 80%; padding: 12px; margin: 10px 0; background: #1e1e1e; border: 1px solid #555; color: white; border-radius: 6px; font-size: 18px; text-align: center; letter-spacing: 5px; }
+        button.btn-submit { padding: 12px 30px; background: #007bff; color: white; border: none; border-radius: 6px; font-weight: bold; font-size: 15px; cursor: pointer; }
+        button.btn-submit:hover { background: #0056b3; }
+        .error { color: #ff4d4d; font-size: 14px; margin-top: 15px; }
+        .hint { color: #777; font-size: 12px; margin-top: 20px; }
+    </style>
+    <script>
+        function selectUser(id, name) {
+            document.querySelectorAll('.tile').forEach(t => t.classList.remove('selected'));
+            event.currentTarget.classList.add('selected');
+            document.getElementById('selected_user_id').value = id;
+            document.getElementById('selected_user_label').innerText = "Logowanie jako: " + name;
+            document.getElementById('pin-section').style.display = 'block';
+            document.getElementById('pin_input').focus();
+        }
+    </script>
+</head>
+<body>
+    <div class="login-container">
+        <h2>Wybierz swój profil</h2>
+        
+        <div class="tiles-grid">
+            {% for u in users %}
+                <div class="tile" onclick="selectUser('{{ u.id }}', '{{ u.username }}')">
+                    <div class="tile-name">{{ u.username }}</div>
+                    <div class="tile-role">[{{ u.role }}]</div>
+                </div>
+            {% endfor %}
+        </div>
+
+        <form action="/login" method="post">
+            <input type="hidden" name="user_id" id="selected_user_id" required>
+            
+            <div id="pin-section" class="pin-box">
+                <div id="selected_user_label" style="margin-bottom: 10px; color: #4CAF50; font-weight: bold;"></div>
+                <input type="password" name="pin" id="pin_input" placeholder="••••" maxlength="10" required>
+                <div>
+                    <button type="submit" class="btn-submit">Zatwierdź i Zaloguj</button>
+                </div>
+            </div>
+        </form>
+
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+        <div class="hint">Domyślny Administrator: wybierz kafelek Admina i wpisz hasło Ara123!</div>
+    </div>
+</body>
+</html>
+"""
+
+HTML_TERMINAL_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <title>Terminal Ścienny - Magazyn</title>
+    <style>
+        body { background-color: #121212; color: #ffffff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        header { display: flex; justify-content: space-between; align-items: center; background: #1e1e1e; padding: 15px 20px; border-radius: 8px; margin-bottom: 20px; }
+        .user-info { font-size: 16px; color: #4CAF50; font-weight: bold; }
+        .header-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        .btn-action { background: #007bff; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; text-decoration: none; font-weight: bold; font-size: 14px; }
+        .btn-action:hover { background: #0056b3; }
+        .logout-btn { background: #dc3545; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; text-decoration: none; font-weight: bold; font-size: 14px; }
+        .logout-btn:hover { background: #c82333; }
+        .container { display: flex; gap: 20px; flex-wrap: wrap; }
+        .panel { background: #1e1e1e; padding: 20px; border-radius: 8px; flex: 1; min-width: 320px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h2 { color: #4CAF50; margin-top: 0; font-size: 18px; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        label { display: block; margin-top: 15px; color: #bbb; font-size: 14px; }
+        select, input { width: 100%; padding: 10px; margin-top: 5px; background: #2c2c2c; border: 1px solid #444; color: white; border-radius: 5px; box-sizing: border-box; }
+        .btn-group { display: flex; gap: 10px; margin-top: 20px; }
+        button.action-btn { flex: 1; padding: 12px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; font-size: 15px; }
+        .btn-wz { background: #ff9800; color: white; }
+        .btn-pz { background: #4CAF50; color: white; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
+        th { background: #2c2c2c; color: #ddd; }
+        .msg { margin-top: 15px; padding: 10px; border-radius: 5px; text-align: center; font-weight: bold; }
+        .success { background: rgba(76, 175, 80, 0.2); color: #4CAF50; }
+        .error { background: rgba(244, 67, 54, 0.2); color: #f44336; }
+        .del-btn { background: #dc3545; color: white; border: none; padding: 5px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+        .del-btn:hover { background: #c82333; }
+    </style>
+</head>
+<body>
+    <header>
+        <div><strong>SYSTEM MAGAZYNOWY (MySQL)</strong></div>
+        <div class="user-info">Zalogowany: {{ user.username }} [{{ user.role }}]</div>
+        <div class="header-actions">
+            {% if user.role == 'ADMIN' %}
+                <a href="/dodaj-produkt-form" class="btn-action" style="background: #28a745;">Dodaj Produkt</a>
+                <a href="/zarzadzaj-uzytkownikami-form" class="btn-action" style="background: #17a2b8;">Zarządzaj Użytkownikami</a>
+            {% endif %}
+            <a href="/logout" class="logout-btn">Wyloguj</a>
+        </div>
+    </header>
+
+    {% if message %}
+        <div class="msg {{ 'success' if not is_error else 'error' }}" style="margin-bottom: 20px;">{{ message }}</div>
+    {% endif %}
+
+    <div class="container">
+        <!-- Panel Operacji -->
+        <div class="panel">
+            <h2>Panel Operacyjny</h2>
+            <form action="/operacja" method="post">
+                <label>Sekcja Docelowa (WZ):</label>
+                <select name="section_name">
+                    <option value="Bar Główny">Bar Główny</option>
+                    <option value="Sala VIP">Sala VIP</option>
+                    <option value="Ogródek">Ogródek</option>
+                </select>
+
+                <label>Kod kreskowy butelki:</label>
+                <input type="text" name="barcode" placeholder="Skanuj lub wpisz kod..." required autofocus>
+
+                <label>Ilość sztuk:</label>
+                <input type="number" name="quantity" value="1" min="1" required>
+
+                <div class="btn-group">
+                    <button type="submit" name="type" value="WYDANIE" class="action-btn btn-wz">WYDAJ (WZ)</button>
+                    <button type="submit" name="type" value="DOSTAWA" class="action-btn btn-pz">PRZYJMIJ (PZ)</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Stan Magazynowy -->
+        <div class="panel" style="flex: 2;">
+            <h2>Stany Magazynowe i Daty</h2>
+            <table>
+                <tr>
+                    <th>Nazwa / Kod</th>
+                    <th>Stan</th>
+                    <th>Data Przyjęcia</th>
+                    <th>Ważność (Termin)</th>
+                    {% if user.role == 'ADMIN' %}<th>Akcja</th>{% endif %}
+                </tr>
+                {% for p in products %}
+                <tr>
+                    <td>
+                        <strong>{{ p.name }}</strong><br>
+                        <small style="color: #888;">{{ p.barcode }}</small>
+                    </td>
+                    <td><strong>{{ p.stock }} szt.</strong></td>
+                    <td><small>{{ p.intake_date }}</small></td>
+                    <td><small style="color: #ffc107;">{{ p.expiry_date }}</small></td>
+                    {% if user.role == 'ADMIN' %}
+                    <td>
+                        <form action="/usun-produkt/{{ p.id }}" method="post" onsubmit="return confirm('Czy na pewno chcesz usunąć pozycję {{ p.name }}?');">
+                            <button type="submit" class="del-btn">Usuń</button>
+                        </form>
+                    </td>
+                    {% endif %}
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+    </div>
+
+    <!-- Historia -->
+    <div class="panel" style="margin-top: 20px; width: 100%; box-sizing: border-box;">
+        <h2>Niezmienna Historia Operacji (Baza MySQL)</h2>
+        <table>
+            <tr><th>Czas</th><th>Typ</th><th>Produkt</th><th>Ilość</th><th>Sekcja / Cel</th><th>Użytkownik</th></tr>
+            {% for h in history %}
+            <tr>
+                <td><small>{{ h.time }}</small></td>
+                <td><strong style="color: {{ '#4CAF50' if h.type == 'DOSTAWA' else '#ff9800' }};">{{ h.type }}</strong></td>
+                <td>{{ h.product }}</td>
+                <td>{{ h.quantity }} szt.</td>
+                <td>{{ h.section }}</td>
+                <td><small>{{ h.user }}</small></td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+</body>
+</html>
+"""
+
+HTML_ADD_PRODUCT_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <title>Dodaj Produkt</title>
+    <style>
+        body { background-color: #121212; color: #ffffff; font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .box { background: #1e1e1e; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); width: 380px; }
+        input { width: 100%; padding: 10px; margin: 8px 0; background: #2c2c2c; border: 1px solid #444; color: white; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+        label { display: block; margin-top: 10px; font-size: 13px; color: #bbb; }
+        button { width: 100%; padding: 12px; background: #28a745; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 15px; }
+        button:hover { background: #218838; }
+        .back { display: block; margin-top: 15px; color: #888; text-decoration: none; font-size: 14px; text-align: center; }
+        .back:hover { color: #fff; }
+        .error { color: #ff4d4d; font-size: 13px; text-align: center; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>Dodaj Nowy Produkt</h2>
+        <form action="/dodaj-produkt" method="post">
+            <label>Nazwa produktu:</label>
+            <input type="text" name="name" placeholder="np. Piwo Jasne 0.5L" required autofocus>
+
+            <label>Kod kreskowy:</label>
+            <input type="text" name="barcode" placeholder="np. 590000000000" required>
+
+            <label>Początkowy stan (ilość sztuk):</label>
+            <input type="number" name="stock" value="0" min="0" required>
+
+            <label>Data przyjęcia:</label>
+            <input type="date" name="intake_date" required>
+
+            <label>Data przydatności (ważności):</label>
+            <input type="date" name="expiry_date">
+
+            <button type="submit">Zapisz produkt</button>
+        </form>
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+        <a href="/" class="back">Powrót do terminala</a>
+    </div>
+</body>
+</html>
+"""
+
+HTML_MANAGE_USERS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <title>Zarządzanie Użytkownikami</title>
+    <style>
+        body { background-color: #121212; color: #ffffff; font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; }
+        .box { background: #1e1e1e; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); width: 450px; }
+        input, select { width: 100%; padding: 10px; margin: 8px 0; background: #2c2c2c; border: 1px solid #444; color: white; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+        button { width: 100%; padding: 10px; background: #4CAF50; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 5px; }
+        button:hover { background: #45a049; }
+        .del-btn { background: #dc3545; padding: 5px 10px; width: auto; font-size: 12px; }
+        .del-btn:hover { background: #c82333; }
+        .back { display: block; margin-top: 20px; color: #888; text-decoration: none; font-size: 14px; text-align: center; }
+        .back:hover { color: #fff; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 13px; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
+        th { background: #2c2c2c; }
+        .error { color: #ff4d4d; font-size: 13px; margin-top: 5px; text-align: center; }
+        h3 { border-bottom: 1px solid #333; padding-bottom: 5px; color: #4CAF50; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>Zarządzanie Użytkownikami</h2>
+        
+        <h3>Dodaj nowego pracownika</h3>
+        <form action="/dodaj-uzytkownika" method="post">
+            <input type="text" name="username" placeholder="Imię i nazwisko" required>
+            <select name="role">
+                <option value="MAGAZYNIER">Magazynier</option>
+                <option value="ADMIN">Administrator</option>
+            </select>
+            <input type="password" name="pin" placeholder="PIN (do logowania)" maxlength="10" required>
+            <button type="submit">Dodaj użytkownika</button>
+        </form>
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+
+        <h3>Lista użytkowników w bazie</h3>
+        <table>
+            <tr><th>Nazwa</th><th>Rola</th><th>Akcja</th></tr>
+            {% for u in users %}
+            <tr>
+                <td>{{ u.username }}</td>
+                <td>{{ u.role }}</td>
+                <td>
+                    {% if u.id != current_user_id %}
+                    <form action="/usun-uzytkownika/{{ u.id }}" method="post" onsubmit="return confirm('Usunąć użytkownika {{ u.username }}?');">
+                        <button type="submit" class="del-btn">Usuń</button>
+                    </form>
+                    {% else %}
+                    <small style="color: #888;">(Ty)</small>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+
+        <a href="/" class="back">Powrót do terminala</a>
+    </div>
+</body>
+</html>
+"""
+
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(50) NOT NULL,
+            role VARCHAR(20) NOT NULL,
+            pin VARCHAR(20) DEFAULT '',
+            password_hash VARCHAR(255) DEFAULT ''
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            barcode VARCHAR(50) NOT NULL UNIQUE,
+            name VARCHAR(100) NOT NULL,
+            stock INT NOT NULL DEFAULT 0,
+            expiry_date VARCHAR(20) DEFAULT 'Brak',
+            intake_date VARCHAR(20) DEFAULT '-'
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            product VARCHAR(100) NOT NULL,
+            section VARCHAR(50) NOT NULL,
+            quantity INT NOT NULL,
+            type VARCHAR(20) NOT NULL,
+            user_info VARCHAR(100) NOT NULL,
+            time VARCHAR(30) NOT NULL
+        )
+    """)
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'ADMIN'")
+    if cursor.fetchone()[0] == 0:
+        default_hash = bcrypt.hashpw("Ara123!".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        cursor.execute("INSERT INTO users (username, role, pin, password_hash) VALUES (%s, %s, %s, %s)", 
+                       ("Administrator Główny", "ADMIN", "2222", default_hash))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+init_db()
+
+@app.get("/", response_class=HTMLResponse)
+def index(message: str = None, is_error: bool = False):
+    global current_session_user_id
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    cursor.execute("SELECT * FROM users")
+    users = cursor.fetchall()
+
+    if current_session_user_id is None:
+        cursor.close()
+        conn.close()
+        t = Template(HTML_LOGIN_TEMPLATE)
+        return t.render(users=users, error=None)
+    
+    cursor.execute("SELECT * FROM users WHERE id = %s", (current_session_user_id,))
+    user = cursor.fetchone()
+    if not user:
+        current_session_user_id = None
+        cursor.close()
+        conn.close()
+        t = Template(HTML_LOGIN_TEMPLATE)
+        return t.render(users=users, error=None)
+        
+    cursor.execute("SELECT * FROM products")
+    products = cursor.fetchall()
+
+    cursor.execute("SELECT * FROM history ORDER BY id DESC LIMIT 50")
+    history = cursor.fetchall()
+    
+    cursor.close()
+    conn.close()
+        
+    t = Template(HTML_TERMINAL_TEMPLATE)
+    return t.render(user=user, products=products, history=history, message=message, is_error=is_error)
+
+@app.post("/login", response_class=HTMLResponse)
+def login(user_id: int = Form(...), pin: str = Form(...)):
+    global current_session_user_id
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    
+    success = False
+    if user:
+        if user['role'] == 'ADMIN' and pin == "Ara123!":
+            success = True
+        elif user['password_hash'] and bcrypt.checkpw(pin.encode('utf-8'), user['password_hash'].encode('utf-8')):
+            success = True
+        elif user['pin'] == pin:
+            success = True
+
+    if not success:
+        cursor.execute("SELECT * FROM users")
+        users = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        t = Template(HTML_LOGIN_TEMPLATE)
+        return t.render(users=users, error="Nieprawidłowe hasło lub PIN!")
+    
+    current_session_user_id = user['id']
+    cursor.close()
+    conn.close()
+    return RedirectResponse(url="/", status_code=303)
+
+@app.get("/logout")
+def logout():
+    global current_session_user_id
+    current_session_user_id = None
+    return RedirectResponse(url="/", status_code=303)
+
+@app.get("/dodaj-produkt-form", response_class=HTMLResponse)
+def dodaj_produkt_form():
+    if current_session_user_id is None:
+        return RedirectResponse(url="/", status_code=303)
+    t = Template(HTML_ADD_PRODUCT_TEMPLATE)
+    return t.render(error=None)
+
+@app.post("/dodaj-produkt", response_class=HTMLResponse)
+def dodaj_produkt(name: str = Form(...), barcode: str = Form(...), stock: int = Form(...), intake_date: str = Form(...), expiry_date: str = Form(None)):
+    if current_session_user_id is None:
+        return RedirectResponse(url="/", status_code=303)
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        formatted_expiry = expiry_date if expiry_date else "Brak"
+        cursor.execute("INSERT INTO products (barcode, name, stock, expiry_date, intake_date) VALUES (%s, %s, %s, %s, %s)",
+                       (barcode.strip(), name.strip(), stock, formatted_expiry, intake_date))
+        conn.commit()
+    except Exception as e:
+        cursor.close()
+        conn.close()
+        t = Template(HTML_ADD_PRODUCT_TEMPLATE)
+        return t.render(error="Produkt z takim kodem kreskowym już istnieje w bazie!")
+        
+    cursor.close()
+    conn.close()
+    return RedirectResponse(url=f"/?message=Dodano produkt: {name}&is_error=false", status_code=303)
+
+@app.get("/zarzadzaj-uzytkownikami-form", response_class=HTMLResponse)
+def zarzadzaj_uzytkownikami_form():
+    if current_session_user_id is None:
+        return RedirectResponse(url="/", status_code=303)
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users")
+    users = cursor.fetchall()
+    cursor.close()
+    conn.close()
+        
+    t = Template(HTML_MANAGE_USERS_TEMPLATE)
+    return t.render(users=users, current_user_id=current_session_user_id, error=None)
+
+@app.post("/dodaj-uzytkownika", response_class=HTMLResponse)
+def dodaj_uzytkownika(username: str = Form(...), role: str = Form(...), pin: str = Form(...)):
+    if current_session_user_id is None:
+        return RedirectResponse(url="/", status_code=303)
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO users (username, role, pin) VALUES (%s, %s, %s)", (username.strip(), role, pin))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    return RedirectResponse(url=f"/?message=Dodano użytkownika: {username}&is_error=false", status_code=303)
+
+@app.post("/usun-uzytkownika/{user_id}", response_class=HTMLResponse)
+def usun_uzytkownika(user_id: int):
+    global current_session_user_id
+    if current_session_user_id is None or user_id == current_session_user_id:
+        return RedirectResponse(url="/?message=Nie możesz usunąć samego siebie!&is_error=true", status_code=303)
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return RedirectResponse(url="/?message=Usunięto użytkownika&is_error=false", status_code=303)
+
+@app.post("/usun-produkt/{product_id}", response_class=HTMLResponse)
+def usun_produkt(product_id: int):
+    if current_session_user_id is None:
+        return RedirectResponse(url="/", status_code=303)
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM products WHERE id = %s", (product_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return RedirectResponse(url="/?message=Usunięto pozycję magazynową&is_error=false", status_code=303)
+
+@app.post("/operacja", response_class=HTMLResponse)
+def make_operation(section_name: str = Form(...), barcode: str = Form(...), quantity: int = Form(...), type: str = Form(...)):
+    global current_session_user_id
+    if current_session_user_id is None:
+        return RedirectResponse(url="/", status_code=303)
+        
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    cursor.execute("SELECT * FROM users WHERE id = %s", (current_session_user_id,))
+    user = cursor.fetchone()
+    
+    cursor.execute("SELECT * FROM products WHERE barcode = %s", (barcode.strip(),))
+    product = cursor.fetchone()
+    
+    if not product:
+        cursor.close()
+        conn.close()
+        return RedirectResponse(url=f"/?message=Nie znaleziono produktu o kodzie {barcode}&is_error=true", status_code=303)
+        
+    new_stock = product['stock']
+    if type == "WYDANIE":
+        if product['stock'] < quantity:
+            cursor.close()
+            conn.close()
+            return RedirectResponse(url=f"/?message=Brak wystarczającej ilości! Dostępne: {product['stock']}&is_error=true", status_code=303)
+        new_stock -= quantity
+    else:
+        new_stock += quantity
+        
+    cursor.execute("UPDATE products SET stock = %s WHERE id = %s", (new_stock, product['id']))
+    
+    time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    user_str = f"{user['username']} ({user['role']})"
+    
+    cursor.execute("INSERT INTO history (product, section, quantity, type, user_info, time) VALUES (%s, %s, %s, %s, %s, %s)",
+                   (product['name'], section_name, quantity, type, user_str, time_str))
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    return RedirectResponse(url=f"/?message=Zatwierdzono {type}: {product['name']}&is_error=false", status_code=303)
